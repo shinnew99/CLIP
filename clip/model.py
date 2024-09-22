@@ -253,14 +253,17 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):  
         super().__init__()
-        self.width = width
-        self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.width = width  # 모델의 임베딩 차원(d_model)
+        self.layers = layers  # ResidualAttentionBlock의 수
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])  # ResidualAttentionBlock에서 사용하는 Attention 헤드 수
+        # 모든 ResidualAttentionBlock에서 사용할 Attention 마스크
+        # self.resblocks: layers수만큼의 ResidualAttentionBlock 순차적으로 쌓은 nn.Sequential 모듈
 
     def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
+        return self.resblocks(x)  # 시퀀스 텐서 X크기 ([L, N, d_model])
+        # 모든 ResidualAttentionBlock을 순차적으로 통과시켜 출력 생성
 
 
 
@@ -293,21 +296,26 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))  # Transformer 출력 (width)을 output_dim으로 변환하는 선형 변환 파라미터.
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        # 1. 패치임베딩
+        x = self.conv1(x)  # shape = [N, width, grid, grid], 이미지 x를 패치로분할하여 임베딩
+        # 2. 패치 텐서 재구성
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [N, width, grid ** 2] 
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
+        # 3. 클래스 토큰 추가
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [N, grid ** 2 + 1, width], 클래스 토큰을 앞에추가
+        # 4. 클래스 토큰을 앞에 추가하여 [N, grid*grid+1, width]
+        x = x + self.positional_embedding.to(x.dtype) # 패치의위치 정보를더함
+        # 5. Layer Normalization
+        x = self.ln_pre(x)  # 패치 임베딩에 LayerNorm 적용
+        # 6. Transformer 인코더 통과
+        x = x.permute(1, 0, 2)  # NLD -> LND, [L, N, Width] 형태로 변환
+        x = self.transformer(x)  # Transformer 인코더를 통과하여 변환된 특징 추출 
+        x = x.permute(1, 0, 2)  # LND -> NLD, [N, L, Width] 형태로 변환 
+        # 7. 최종 정규화 및 프로젝션
+        x = self.ln_post(x[:, 0, :])  # 2번째 Layer Normalization, 클래스 코튼에 LayerNorm 적용
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-
-        x = self.ln_post(x[:, 0, :])
-
-        if self.proj is not None:
-            x = x @ self.proj
+        if self.proj is not None: # 최종 임베딩 차원으로 선형 변환
+            x = x @ self.proj  
 
         return x
 
@@ -347,12 +355,13 @@ class CLIP(nn.Module):
 
         self.context_length = context_length
 
+        # Vision 인코더 선택
         if isinstance(vision_layers, (tuple, list)):
-            vision_heads = vision_width * 32 // 64
+            vision_heads = vision_width * 32 // 64  # vision_layers가 tuple/list인 경우, ModifiedREsNet을 사용
             self.visual = ModifiedResNet(
                 layers=vision_layers,
                 output_dim=embed_dim,
-                heads=vision_heads,
+                heads=vision_heads,  # vision_width*32 //64 = vision_width/2
                 input_resolution=image_resolution,
                 width=vision_width
             )
@@ -367,24 +376,27 @@ class CLIP(nn.Module):
                 output_dim=embed_dim
             )
 
-        self.transformer = Transformer(
+        # Transformer 인코더
+        self.transformer = Transformer(  # 텍스트 인코더로 사용할 Transformer를 초기화한다. 
             width=transformer_width,
             layers=transformer_layers,
             heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
+            attn_mask=self.build_attention_mask()  # Casual Attention을 위한 마스크
         )  # 텍스트 인코더로 사용할 Transformer를 초기화함, attn_mask: Causal Attention을 위한 마스크.
 
+        # 텍스트 임베딩 및 정규화
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)  # 단어 임베딩 레이어
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))  # 단어의 위치 정보를 담은 학습 가능한 파라미터
         self.ln_final = LayerNorm(transformer_width) # 텍스트 인코더의 마지막 LayerNorm
 
+        # 텍스트 프로젝션 및 Logit scale
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))  # 텍스트 인코더의 출력을 이미지 임베딩과 동일한 차원(embed_dim)으로 변환하는 선형 변환 파라미터
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))  # 유사도 계산 시 사용되는 스케일 파라미터. 초기값은 log(1 / 0.07)
 
-        self.initialize_parameters()
+        self.initialize_parameters()  # 모델의 가중치를 초기화하는 메서드를 호출한다.
 
-
+    # 파라미터 초기화 메서드
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)  # 정규 분포로 초기화, 왜 0.02일까..?
         nn.init.normal_(self.positional_embedding, std=0.01)  # 정규 분포로 초기화, 왜 0.01일까..?
@@ -416,7 +428,7 @@ class CLIP(nn.Module):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
 
-    #  Casual Attention 마스크를 생성하여 텍스트 인코더에서 현재 토큰 이후의 토큰을 참조하지 못하도록 함. --> 양심상 무슨말인지 모르겠어.
+    # Attention Mask 생성: 목적은 Casual Attention 마스크를 생성하여 텍스트 인코더에서 현재 토큰 이후의 토큰을 참조하지 못하도록 함. --> 양심상 무슨말인지 모르겠어.
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
@@ -427,48 +439,57 @@ class CLIP(nn.Module):
         return mask
 
 
-    # 모델의 파라미터 데이터 타입을 반환함, 이는 입력 텐서의 타입과 일치시켜 혼합 정밀도 학습을 지원함.
+    # dtype 속성, 모델의 파라미터 데이터 타입을 반환함, 이는 입력 텐서의 타입과 일치시켜 혼합 정밀도 학습을 지원함.
     @property
     def dtype(self):  
         return self.visual.conv1.weight.dtype
 
+    # 이미지 인코딩 메서드
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
     # 입력: 이미지 텐서
     # 동작: 시각적 인코더(self.visual)를 통해 이미지 특징을 추출함
     # 출력: 이미지 임베딩 벡터
 
-
+    # 텍스트 인코딩 메서드
     def encode_text(self, text):  
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
-        # 텍스트 토큰을 임베딩 벡터로 변환
+        # 텍스트 토큰을 임베딩 벡터로 변환, [batch_size, n_ctx, transformer_width]
         x = x + self.positional_embedding.type(self.dtype)  # positional embedding, 위치 정보를 추가. 여기서 위치란게 뭘까..? 이 정보를 추가하는게 뭐가 중요한걸까
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
+        # Transformer 인코더 통과
+        x = x.permute(1, 0, 2)  # NLD -> LND, [n_ctx, batch_size, transformer_width] 형태로 변환
+        x = self.transformer(x)  # Transformer 인코더를 통과
+        x = x.permute(1, 0, 2)  # LND -> NLD, [batch_size, n_ctx, transformer_width] 형태로 변환
+        x = self.ln_final(x).type(self.dtype)  # 최종 LayerNorm 적용
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection # 우와 이런 코드 처음봄, 
+        # 각 시퀀스에서 EOT(End of Text) 토큰의 위치를 찾는다.
+        # 토큰의 특징을 text_projection을 통해 이미지 임베딩과 동일한 차원으로 변환
 
         return x
 
+    # 순전파 메서드
     def forward(self, image, text):
-        image_features = self.encode_image(image)
-        text_features = self.encode_text(text)
+        image_features = self.encode_image(image)  # 시각적 인코더를 통해 이미지 임베딩 추출
+        text_features = self.encode_text(text)  # 텍스트 인코더를 통해 텍스트 임베딩 추출
 
         # normalized features
-        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        image_features = image_features / image_features.norm(dim=1, keepdim=True) 
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
         # cosine similarity as logits
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logits_per_image.t()
+        logit_scale = self.logit_scale.exp()  # 학습 가능한 스케일파라미터를 지수 함수로 변환하여 사용
+        logits_per_image = logit_scale * image_features @ text_features.t()  # 이미지 임베딩과 텍스트 임베딩 간의 코사인 유사도를 스케일링해서 계산
+        logits_per_text = logits_per_image.t()  # logits_per_image의 전치 행렬
 
-        # shape = [global_batch_size, global_batch_size]
+        # shape = [global_batch_size, global_batch_size] <--크기의 로짓 행렬을 반환함, 이는이미지와 텍스트 간의 유사도를 나타냄
         return logits_per_image, logits_per_text
+    # 여기서!
+    # 1. 멀티모달 학습: 이미지와 텍스트를 동시에 인코딩하여 공통 벡터 공간에서의 유사성을 학습함
+    # 2. Contrastive Learning: 양자간의 유사도를 최대화하고, 서로 다른 쌍의 유사도를 최소화하여 효과적인 특징을 학습한다.
+    # 3. 유연한 인코더 선택: ResNet 또는 ViT 중 선택하여 시각적 인코더를 구성 할 수 있다.
 
 
 # convert_weights 함수는 모델의 일부 파라미터를 FP16으로 변환하여 메모리 사용량을 줄이고 계산 속도를 향상시키는 역할을 함.
@@ -476,67 +497,106 @@ def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""
 
     def _convert_weights_to_fp16(l):
-        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):  # Convolution 및 Linear 레이어, 파라미터 nn.Conv1d, nn.Conv2d, nn.Linear의 가중치(weight)와 편향(bias)을 FP16으로 변환
             l.weight.data = l.weight.data.half()
             if l.bias is not None:
                 l.bias.data = l.bias.data.half()
 
         if isinstance(l, nn.MultiheadAttention):
-            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:  # Fp16으로 변환
                 tensor = getattr(l, attr)
                 if tensor is not None:
                     tensor.data = tensor.data.half()
 
-        for name in ["text_projection", "proj"]:
+        for name in ["text_projection", "proj"]:  # 이들 파라미터가 존재하면 FP16으로 변환, 이는 모델의 나머지 부분과 호환성을 유지하는데 도움된다.
             if hasattr(l, name):
                 attr = getattr(l, name)
                 if attr is not None:
                     attr.data = attr.data.half()
 
-    model.apply(_convert_weights_to_fp16)
+    model.apply(_convert_weights_to_fp16)  # 모델의 모든 서브모듈에 대해 _convert_weights_to_fp16 함수를 재귀적으로 적용한다.
+# 혼합 정밀도 학습 지원: 모델의 일부 파라미터를 FP16으로 변환하여 메모리사용량을 줄이고, GPU에서의 계산 속도를 향상시킨다.
+# 효율성: FP16은 FP32보다 절반의 메모리를 사용하며, 많은 GPU에서 더 빠른 연산을 지원한다.
+# 호한성: 일부 파라미터만 FP16으로 변환하여 모델의 나머지 부분과 호환성을 유지한다.
 
 
 # 저장된 상태 사전을 로드하여 CLIP 모델을 구축하고 초기화함
 def build_model(state_dict: dict):
-    vit = "visual.proj" in state_dict   # vision 인코더 유형을 결정
+    # 1. vision 인코더 유형을 결정
+    vit = "visual.proj" in state_dict   
 
-    if vit:  # 1. state_dict에 "visual.proj" 키가 있으면 Vision Transformer(ViT)를 사용
-        vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
-        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
-        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
-        image_resolution = vision_patch_size * grid_size
-    else:  # 2. 그렇지 않으면 ModifiedResNet을 사용
+    # 2. Vision 인코더 파라미터 추출:
+    if vit:  # 2-1) state_dict에 "visual.proj" 키가 있으면 Vision Transformer(ViT)를 사용
+        vision_width = state_dict["visual.conv1.weight"].shape[0]  # conv1 레이어의출력 채널 수
+        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])  # ViT Attention 레이어 수 
+        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]  # conv1 레이어의 커널크기
+        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)  # positional 임베딩의 grid 크기, (positional_embedding.shape[0]-1)의 제곱근
+        image_resolution = vision_patch_size * grid_size  # 패치 크기와 그리드 크기를 곱해서 이미지 해상도 계산
+    else:  # 2-2) 그렇지 않으면 ModifiedResNet을 사용
         counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
-        vision_layers = tuple(counts)
-        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
-        output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
+        vision_layers = tuple(counts)  # 각 레이어의 블록 수를 tuple로 저장
+        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]  # layer1의 첫번째 conv1 레이어의 출력수
+        output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)  # Attention Pooling의 positional embedding grid크기
         vision_patch_size = None
         assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
-        image_resolution = output_width * 32
+        image_resolution = output_width * 32  # (ResNet의 다운샘플링 비율 고려)
 
     # 3. 텍스트 인코더 파라미터 추출
-    embed_dim = state_dict["text_projection"].shape[1]
-    context_length = state_dict["positional_embedding"].shape[0]
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
-    transformer_width = state_dict["ln_final.weight"].shape[0]
-    transformer_heads = transformer_width // 64
+    embed_dim = state_dict["text_projection"].shape[1]  # 텍스트 프로젝션의 출력차원
+    context_length = state_dict["positional_embedding"].shape[0]  # 텍스트의 최대 토큰 수
+    vocab_size = state_dict["token_embedding.weight"].shape[0]  # 단어 집합의 크기
+    transformer_width = state_dict["ln_final.weight"].shape[0]  # 텍스트 Transformer의 임베딩 차원
+    transformer_heads = transformer_width // 64  # Attention 헤드 수
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
+    # 텍스트 Transformer의 레이어 수
 
-    # CLIP 모델 인스턴스화
+
+    # 4. CLIP 모델 인스턴스화
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
     )
 
-    # 불필요한 키 제거 
+    # 5. 불필요한 키 제거 
     for key in ["input_resolution", "context_length", "vocab_size"]:   # 어떻게하다가 이 key들이 불필요하게 됐을까
         if key in state_dict:
             del state_dict[key]
 
 
-    # 파라미터 변환 및 로딩
-    convert_weights(model)
-    model.load_state_dict(state_dict)
-    return model.eval()
+    # 6. 파라미터 변환 및 로딩
+    convert_weights(model)  # FP16으로 변환
+    model.load_state_dict(state_dict)  # 상태 사전을 모델에 로드
+    return model.eval()  # 평가 모드로 전환
+
+
+# 전체 흐름
+# 1. 데이터 입력:
+# 이미지: 시각적 인코더(ModifiedResNet 또는 VisionTransformer)를 통해 이미지 임베딩으로 변환.
+# 텍스트: 텍스트 인코더(Transformer)를 통해 텍스트 임베딩으로 변환.
+
+#2. 특징 추출:
+# 시각적 인코더: 이미지의 고차원 특징을 추출하여 고정된 크기의 임베딩 벡터를 생성.
+# 텍스트 인코더: 텍스트의 의미적 특징을 추출하여 고정된 크기의 임베딩 벡터를 생성.
+
+# 3. 유사도 계산:
+# 코사인 유사도: 이미지 임베딩과 텍스트 임베딩 간의 유사도를 계산하여, 이미지-텍스트 쌍의 일치 정도를 평가.
+
+# 4. 모델 학습 및 평가:
+# Contrastive Learning: 이미지-텍스트 쌍의 유사도를 최대화하고, 비일치 쌍의 유사도를 최소화하여 모델을 학습.
+# 평가: 모델은 다양한 멀티모달 작업(예: 이미지 캡셔닝, 텍스트 기반 이미지 검색 등)에 사용될 수 있습니다.
+
+
+
+
+# 각 func의 역할
+# CLIP 모델의 핵심 구성 요소들을 상세히 구현한 것으로, 이미지와 텍스트를 동시에 인코딩하여 공통 벡터 공간에서의 유사성을 학습하는 구조를 가지고 있다. 
+# 각 클래스와 함수는 모델의 특정 부분을 담당하며, 전체적으로 효과적인 멀티모달 학습을 지원한다.
+# AttentionPool2d: 이미지 특징을 Attention을 통해 집약.
+# ModifiedResNet: ResNet을 기반으로 한 시각적 인코더.
+# VisionTransformer: Transformer 기반의 시각적 인코더.
+# ResidualAttentionBlock: Transformer의 기본 블록.
+# Transformer: 여러 개의 Attention 블록을 쌓아 Transformer 인코더 구성.
+# CLIP: 이미지와 텍스트를 동시에 인코딩하고, 유사도를 계산하는 전체 모델.
+# convert_weights: 모델 파라미터를 FP16으로 변환하여 효율성 향상.
+# build_model: 저장된 상태 사전을 로드하여 CLIP 모델을 구축하고 초기화.
