@@ -152,20 +152,29 @@ if version.parse(torch.__version__) < version.parse("1.7.1"):
         if not jit:  # jit이 False인 경우
             model = build_model(state_dict or model.state_dict()).to(device)  # 로드된 state_dict를 사용하여 CLIP 모델을 구축한다, model을 보통 state_dict로 넣나 보다
             if str(device) == "cpu":
-                model.float()  # 디바이스가 CPU인 경우, 모델을 float()으로 변환한다. <-- 이게 가능한가..? 
+                model.float()  # 디바이스가 CPU인 경우, 모델을 float()으로 변환한다, model.state_dict()로 저장하면 K와 V의 dict 형태로 저장되는데 이떄 V가 tensor값이기 때문에 전부 float로 변환됨
             return model, _transform(model.visual.input_resolution)  # 모델과 전처리 파이프라인을 반환한다.
         
         # patch the device names - JIT 모델의 디바이스 패치
         # 디바이스 노드 생성
-        device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])  #  torch.jit.trace는 빈 텐서를 지정된 디바이스로 이동시키는 트레이싱을 수행한다.
+        device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])  #  torch.jit.trace는 빈 텐서를 지정된 디바이스로 이동시키는 트레이싱, 추적한다, 결론적으로 내 코드가 돌아가는 환경이 CPU인지, GPU인지 추적하는 코드
+        # torch.jit.trace: 주어진 함수의 실행을 추적하고, 그 함수가 실행되는 과정을 기록하여 그래프 형태로 저장
+        # torch.one([]): 크기가 없는 텐서를 만듦, 이 텐서는 device 정보를 설정하는데 사용
+        # => .to(torch.device(device))를 통해 텐서를 지정된 장치로 이동시킴, device='cuda'면 텐서가 GPU로, device='cpu'면 텐서가 CPU로 이동함
         device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)[-1]]  # device_node는 생성된 그래프에서 "Device"관련 노드를 추출한다.
+        # prim::Constant는 JIT 컴파일 시 장치 정보와 관련된 상수를 나타낸다.
+        # [-1]로 마지막 장치 정보에 대한 정보를 tensor에 저장
+        # 즉, JIT 모델 내 장치 설정을 반영해서 다른 사람이 이 코드를 사용하더라도 의도된 장비
+
+        # JIT는 코드를 작성할 떄부터 들어가 있는 코드 작성자의 배려로 느껴짐
+        # "이 코드를 clone 해가서 쓸 당신들의 환경에서 편의를 좀 더 제공하고자 내가 설정을 미리 해줄게"
 
         # 노드 속성 가져오기 함수
-        def _node_get(node: torch._C.Node, key:str):  # _node_get는 노드의 특정 속성을 가져오는 헬퍼 함수이다, 여기서 C가 cuda일까?
+        def _node_get(node: torch._C.Node, key:str):  # _node_get는 노드의 특정 속성을 가져오는 헬퍼 함수이다, 여기서 C가 는 C++의 API를 파이썬에서 사용할 수 있는 라이브러리(PyTorch) 형태로 가지고 옴
             """Gets attributes of a node which is polymorphic over return type.
             From https://github.com/pytorch/pytorch/pull/82628          
             """
-            sel = node.kindOf(key)
+            sel = node.kindOf(key)  # kindOf: (key)의 타입을 반환. 정수, 문자열, 장치 정보 등등
             return getattr(node, sel)(key)
         
         # 디바이스 패치 함수
@@ -182,6 +191,8 @@ if version.parse(torch.__version__) < version.parse("1.7.1"):
                 for node in graph.findAllNodes("prim::Constant"):  # 노드를 연결하는 역할인걸까..?
                      if "value" in node.attributeNames() and str(_node_get(node, "value").startswith("cuda")):
                          node.copyAttributes(device_node)
+                        # 어떤 device든 node의 형태로 model.dict()에 있는 value들을 가져오겠다.
+
         
         model.apply(patch_device)  # 모델 전체에 patch_device를 적용
         patch_device(model.encode_image)  # 모델에 image와 text를 encoding하는 걸까?
